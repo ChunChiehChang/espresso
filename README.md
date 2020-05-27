@@ -20,20 +20,14 @@ We provide state-of-the-art training recipes for the following speech datasets:
 * [PyTorch](http://pytorch.org/) version >= 1.4.0
 * Python version >= 3.6
 * For training new models, you'll also need an NVIDIA GPU and [NCCL](https://github.com/NVIDIA/nccl)
-* **For faster training** install NVIDIA's [apex](https://github.com/NVIDIA/apex) library:
-```bash
-git clone https://github.com/NVIDIA/apex
-cd apex
-pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" --global-option="--deprecated_fused_adam" --global-option="--xentropy" --global-option="--fast_multihead_attn" ./
-```
-
-Currently Espresso only support installing from source.
-
-To install Espresso from source and develop locally:
+* **To install Espresso** from source and develop locally:
 ```bash
 git clone https://github.com/freewym/espresso
 cd espresso
 pip install --editable .
+
+# on MacOS:
+# CFLAGS="-stdlib=libc++" pip install --editable ./
 pip install kaldi_io
 pip install sentencepiece
 cd espresso/tools; make KALDI=<path/to/a/compiled/kaldi/directory>
@@ -42,15 +36,23 @@ add your Python path to `PATH` variable in `examples/asr_<dataset>/path.sh`, the
 
 kaldi\_io is required for reading kaldi scp files. sentencepiece is required for subword pieces training/encoding.
 Kaldi is required for data preparation, feature extraction, scoring for some datasets (e.g., Switchboard), and decoding for all hybrid systems.
-
-If you want to use [PyChain](https://github.com/YiwenShaoStephen/pychain) for [LF-MMI](https://www.isca-speech.org/archive/Interspeech_2016/pdfs/0595.PDF) training, you also need to install PyChain (and OpenFst):
+* If you want to use [PyChain](https://github.com/YiwenShaoStephen/pychain) for [LF-MMI](https://www.isca-speech.org/archive/Interspeech_2016/pdfs/0595.PDF) training, you also need to install PyChain (and OpenFst):
 
 edit `PYTHON_DIR` variable in `espresso/tools/Makefile` (default: `~/anaconda3/bin`), and then
 ```bash
 cd espresso/tools; make openfst pychain
- ```
+```
+* **For faster training** install NVIDIA's [apex](https://github.com/NVIDIA/apex) library:
+```bash
+git clone https://github.com/NVIDIA/apex
+cd apex
+pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" \
+  --global-option="--deprecated_fused_adam" --global-option="--xentropy" \
+  --global-option="--fast_multihead_attn" ./
+```
 
 # License
+
 Espresso is MIT-licensed.
 
 # Citation
