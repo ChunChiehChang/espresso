@@ -242,5 +242,5 @@ def base_architecture(args):
 
 
 @register_model_architecture("speech_lstm_encoder_model", "speech_conv_lstm_encoder_model_wsj")
-def encoder_conv_lstm_wsj(args):
+def conv_lstm_encoder_wsj(args):
     base_architecture(args)
