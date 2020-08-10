@@ -217,18 +217,17 @@ def train(args, trainer, task, epoch_itr):
             "train_step-%d" % i
         ):
             log_output = trainer.train_step(samples)
-            if log_output is None:  # OOM, overflow, ...
-                continue
 
-        # log mid-epoch stats
-        num_updates = trainer.get_num_updates()
-        if num_updates % args.log_interval == 0:
-            stats = get_training_stats(metrics.get_smoothed_values("train_inner"))
-            progress.log(stats, tag="train_inner", step=num_updates)
+        if log_output is not None:  # not OOM, overflow, ...
+            # log mid-epoch stats
+            num_updates = trainer.get_num_updates()
+            if num_updates % args.log_interval == 0:
+                stats = get_training_stats(metrics.get_smoothed_values("train_inner"))
+                progress.log(stats, tag="train_inner", step=num_updates)
 
-            # reset mid-epoch stats after each log interval
-            # the end-of-epoch stats will still be preserved
-            metrics.reset_meters("train_inner")
+                # reset mid-epoch stats after each log interval
+                # the end-of-epoch stats will still be preserved
+                metrics.reset_meters("train_inner")
 
         # update the state prior stored in the model for cross-entropy training
         if hasattr(task, "update_state_prior"):
