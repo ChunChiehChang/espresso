@@ -11,6 +11,7 @@ import contextlib
 from itertools import chain
 import logging
 import sys
+import time
 from typing import Any, Dict, List
 
 import torch
@@ -95,7 +96,24 @@ class Trainer(object):
         if self.quantizer is not None:
             self.quantizer.set_trainer(self)
 
+        # get detailed cuda environment
+        if self.cuda:
+            self.cuda_env = utils.CudaEnvironment()
+            if self.data_parallel_world_size > 1:
+                self.cuda_env_arr = distributed_utils.all_gather_list(self.cuda_env)
+            else:
+                self.cuda_env_arr = [self.cuda_env]
+            if self.data_parallel_rank == 0:
+                utils.CudaEnvironment.pretty_print_cuda_env_list(self.cuda_env_arr)
+        else:
+            self.cuda_env = None
+            self.cuda_env_arr = None
+
         metrics.log_start_time("wall", priority=790, round=0)
+
+        self._start_time = time.time()
+        self._previous_training_time = 0
+        self._cumulative_training_time = None
 
     def reinitialize(self):
         """Reinitialize the Trainer, typically after model params change."""
@@ -205,6 +223,7 @@ class Trainer(object):
         """Save all training state in a checkpoint file."""
         if self.is_data_parallel_master:  # only save one checkpoint
             extra_state["metrics"] = metrics.state_dict()
+            extra_state["previous_training_time"] = self.cumulative_training_time()
             checkpoint_utils.save_state(
                 filename,
                 self.args,
@@ -278,16 +297,9 @@ class Trainer(object):
                 )
             )
 
-            # handle changed world size
-            cpt_world_size = state["args"].distributed_world_size
-            if cpt_world_size != self.args.distributed_world_size:
-                logger.info("world size changed from checkpoint: {} -> {}".format(
-                    cpt_world_size, self.args.distributed_world_size
-                ))
-                old_iters = extra_state["train_iterator"]["iterations_in_epoch"]
-                extra_state["train_iterator"]["iterations_in_epoch"] = int(
-                    old_iters * cpt_world_size / self.args.distributed_world_size
-                )
+            if "previous_training_time" in extra_state:
+                self._previous_training_time = extra_state["previous_training_time"]
+                self._start_time = time.time()
 
             self.lr_step(epoch)
 
@@ -437,6 +449,10 @@ class Trainer(object):
                     )
                     ooms += 1
                     self.zero_grad()
+                    if self.cuda:
+                        torch.cuda.empty_cache()
+                    if self.args.distributed_world_size == 1:
+                        return None
                 else:
                     raise e
 
@@ -462,9 +478,14 @@ class Trainer(object):
 
         # gather logging outputs from all replicas
         if self._sync_stats():
-            logging_outputs, (sample_size, ooms) = self._aggregate_logging_outputs(
-                logging_outputs, sample_size, ooms, ignore=is_dummy_batch,
+            train_time = self._local_cumulative_training_time()
+            logging_outputs, (sample_size, ooms, total_train_time) = self._aggregate_logging_outputs(
+                logging_outputs, sample_size, ooms, train_time, ignore=is_dummy_batch,
             )
+            self._cumulative_training_time = total_train_time / self.data_parallel_world_size
+
+        if hasattr(self.model, 'all_reduce'):
+            self.model.all_reduce()
 
         overflow = False
         try:
@@ -473,17 +494,19 @@ class Trainer(object):
                 gradients = xm._fetch_gradients(self.optimizer.optimizer)
                 xm.all_reduce('sum', gradients, scale=1.0 / self.data_parallel_world_size)
 
-            # multiply gradients by (# GPUs / sample_size) since DDP
-            # already normalizes by the number of GPUs. Thus we get
-            # (sum_of_gradients / sample_size).
-            if not self.args.use_bmuf:
-                self.optimizer.multiply_grads(self.data_parallel_world_size / sample_size)
-            elif sample_size > 0:  # BMUF needs to check sample size
-                num = self.data_parallel_world_size if self._sync_stats() else 1
-                self.optimizer.multiply_grads(num / sample_size)
+            with torch.autograd.profiler.record_function("multiply-grads"):
+                # multiply gradients by (# GPUs / sample_size) since DDP
+                # already normalizes by the number of GPUs. Thus we get
+                # (sum_of_gradients / sample_size).
+                if not self.args.use_bmuf:
+                    self.optimizer.multiply_grads(self.data_parallel_world_size / sample_size)
+                elif sample_size > 0:  # BMUF needs to check sample size
+                    num = self.data_parallel_world_size if self._sync_stats() else 1
+                    self.optimizer.multiply_grads(num / sample_size)
 
-            # clip grads
-            grad_norm = self.clip_grad_norm(self.args.clip_norm)
+            with torch.autograd.profiler.record_function("clip-grads"):
+                # clip grads
+                grad_norm = self.clip_grad_norm(self.args.clip_norm)
 
             # check that grad norms are consistent across workers
             if (
@@ -493,8 +516,9 @@ class Trainer(object):
             ):
                 self._check_grad_norms(grad_norm)
 
-            # take an optimization step
-            self.optimizer.step()
+            with torch.autograd.profiler.record_function("optimizer"):
+                # take an optimization step
+                self.optimizer.step()
         except FloatingPointError:
             # re-run the forward and backward pass with hooks attached to print
             # out where it fails
@@ -706,6 +730,17 @@ class Trainer(object):
 
     def clip_grad_norm(self, clip_norm):
         return self.optimizer.clip_grad_norm(clip_norm, aggregate_norm_fn=None)
+
+    def cumulative_training_time(self):
+        if self._cumulative_training_time is None:
+            # single GPU
+            return self._local_cumulative_training_time()
+        else:
+            return self._cumulative_training_time
+
+    def _local_cumulative_training_time(self):
+        """Aggregate training time in seconds."""
+        return time.time() - self._start_time + self._previous_training_time
 
     def _prepare_sample(self, sample):
         if sample == "DUMMY":

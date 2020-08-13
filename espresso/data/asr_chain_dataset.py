@@ -16,10 +16,11 @@ from fairseq.data import FairseqDataset
 
 import espresso.tools.utils as speech_utils
 
+
 logger = logging.getLogger(__name__)
 
 
-def collate(samples):
+def collate(samples, pad_to_length=None, src_bucketed=False):
     try:
         from pychain import ChainGraphBatch
     except ImportError:
@@ -28,9 +29,12 @@ def collate(samples):
     if len(samples) == 0:
         return {}
 
-    def merge(key):
+    def merge(key, pad_to_length=None):
         if key == "source":
-            return speech_utils.collate_frames([s[key] for s in samples], 0.0)
+            return speech_utils.collate_frames(
+                [s[key] for s in samples], 0.0,
+                pad_to_length=pad_to_length,
+            )
         elif key == "target":
             max_num_transitions = max(s["target"].num_transitions for s in samples)
             max_num_states = max(s["target"].num_states for s in samples)
@@ -43,14 +47,19 @@ def collate(samples):
             raise ValueError("Invalid key.")
 
     id = torch.LongTensor([s["id"] for s in samples])
-    src_frames = merge("source")
+    src_frames = merge("source", pad_to_length=pad_to_length["source"] if pad_to_length is not None else None)
     # sort by descending source length
-    src_lengths = torch.IntTensor([s["source"].size(0) for s in samples])
+    if pad_to_length is not None or src_bucketed:
+        src_lengths = torch.IntTensor([
+            s["source"].ne(0.0).any(dim=1).int().sum() for s in samples
+        ])
+    else:
+        src_lengths = torch.IntTensor([s["source"].size(0) for s in samples])
     src_lengths, sort_order = src_lengths.sort(descending=True)
     id = id.index_select(0, sort_order)
     utt_id = [samples[i]["utt_id"] for i in sort_order.numpy()]
     src_frames = src_frames.index_select(0, sort_order)
-    ntokens = sum(s["source"].size(0) for s in samples)
+    ntokens = src_lengths.sum().item()
 
     target = None
     if samples[0].get("target", None) is not None:
@@ -101,7 +110,7 @@ class NumeratorGraphDataset(FairseqDataset):
         for i, rxfile in enumerate(rxfiles):
             file_path, offset = self._parse_rxfile(rxfile)
             fst = simplefst.StdVectorFst.read_ark(file_path, offset)
-            graph = ChainGraph(fst, leaky_mode="uniform")
+            graph = ChainGraph(fst, initial_mode="fst", final_mode="fst", log_domain=True)
             if not graph.is_empty:  # skip empty graphs
                 self.utt_ids.append(utt_ids[i])
                 self.rxfiles.append(rxfile)
@@ -155,11 +164,14 @@ class AsrChainDataset(FairseqDataset):
         tgt_sizes (List[int], optional): target sizes (num of states in the numerator graph)
         text  (torch.utils.data.Dataset, optional): text dataset to wrap
         shuffle (bool, optional): shuffle dataset elements before batching
-            (default: True)
+            (default: True).
+        num_buckets (int, optional): if set to a value greater than 0, then
+            batches will be bucketed into the given number of batch shapes.
     """
 
     def __init__(
         self, src, src_sizes, tgt=None, tgt_sizes=None, text=None, shuffle=True,
+        num_buckets=0,
     ):
         self.src = src
         self.tgt = tgt
@@ -182,6 +194,29 @@ class AsrChainDataset(FairseqDataset):
                 "Removed {} examples due to empty numerator graphs or missing entries, "
                 "{} remaining".format(num_removed, num_after_matching)
             )
+
+        if num_buckets > 0:
+            from espresso.data import FeatBucketPadLengthDataset
+            self.src = FeatBucketPadLengthDataset(
+                self.src,
+                sizes=self.src_sizes,
+                num_buckets=num_buckets,
+                pad_idx=0.0,
+                left_pad=False,
+            )
+            self.src_sizes = self.src.sizes
+            logger.info("bucketing source lengths: {}".format(list(self.src.buckets)))
+
+            # determine bucket sizes using self.num_tokens, which will return
+            # the padded lengths (thanks to FeatBucketPadLengthDataset)
+            num_tokens = np.vectorize(self.num_tokens, otypes=[np.long])
+            self.bucketed_num_tokens = num_tokens(np.arange(len(self.src)))
+            self.buckets = [
+                (None, num_tokens)
+                for num_tokens in np.unique(self.bucketed_num_tokens)
+            ]
+        else:
+            self.buckets = None
 
     def _match_src_tgt(self):
         """Makes utterances in src and tgt the same order in terms of
@@ -229,6 +264,9 @@ class AsrChainDataset(FairseqDataset):
         assert self.src.utt_ids == self.text.utt_ids
         return True
 
+    def get_batch_shapes(self):
+        return self.buckets
+
     def __getitem__(self, index):
         tgt_item = self.tgt[index] if self.tgt is not None else None
         text_item = self.text[index][1] if self.text is not None else None
@@ -245,11 +283,14 @@ class AsrChainDataset(FairseqDataset):
     def __len__(self):
         return len(self.src)
 
-    def collater(self, samples):
+    def collater(self, samples, pad_to_length=None):
         """Merge a list of samples to form a mini-batch.
 
         Args:
             samples (List[dict]): samples to collate
+            pad_to_length (dict, optional): a dictionary of
+                {'source': source_pad_to_length}
+                to indicate the max length to pad to in source and target respectively.
 
         Returns:
             dict: a mini-batch with the following keys:
@@ -269,7 +310,7 @@ class AsrChainDataset(FairseqDataset):
                     numerator graphs
                 - `text` (List[str]): list of original text
         """
-        return collate(samples)
+        return collate(samples, pad_to_length=pad_to_length, src_bucketed=(self.buckets is not None))
 
     def num_tokens(self, index):
         """Return the number of frames in a sample. This value is used to
@@ -288,9 +329,18 @@ class AsrChainDataset(FairseqDataset):
             indices = np.random.permutation(len(self))
         else:
             indices = np.arange(len(self))
-        if self.tgt_sizes is not None:
-            indices = indices[np.argsort(self.tgt_sizes[indices], kind="mergesort")]
-        return indices[np.argsort(self.src_sizes[indices], kind="mergesort")]
+        if self.buckets is None:
+            # sort by target length, then source length
+            if self.tgt_sizes is not None:
+                indices = indices[
+                    np.argsort(self.tgt_sizes[indices], kind="mergesort")
+                ]
+            return indices[np.argsort(self.src_sizes[indices], kind="mergesort")]
+        else:
+            # sort by bucketed_num_tokens, which is padded_src_len
+            return indices[
+                np.argsort(self.bucketed_num_tokens[indices], kind="mergesort")
+            ]
 
     @property
     def supports_prefetch(self):

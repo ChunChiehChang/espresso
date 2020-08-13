@@ -16,6 +16,7 @@ train_set=train_nodup
 valid_set=train_dev
 test_set="train_dev eval2000 rt03"
 checkpoint=checkpoint_best.pt
+use_transformer=false
 
 # LM related
 lm_affix=
@@ -48,7 +49,11 @@ apply_specaug=false
 . ./utils/parse_options.sh
 
 lmdir=exp/lm_lstm${lm_affix:+_${lm_affix}}
-dir=exp/lstm${affix:+_$affix}
+if $use_transformer; then
+  dir=exp/transformer${affix:+_$affix}
+else
+  dir=exp/lstm${affix:+_$affix}
+fi
 
 if [ $stage -le 0 ]; then
   echo "Stage 0: Data Preparation"
@@ -186,7 +191,7 @@ if [ $stage -le 3 ]; then
   test_paths= && for dataset in $test_set; do test_paths="$test_paths $lmdatadir/$dataset.tokens"; done
   test_paths=$(echo $test_paths | awk '{$1=$1;print}' | tr ' ' ',')
   ${decode_cmd} $lmdatadir/log/preprocess.log \
-    python3 ../../preprocess.py --user-dir espresso --task language_modeling_for_asr \
+    python3 ../../fairseq_cli/preprocess.py --user-dir espresso --task language_modeling_for_asr \
       --workers 50 --srcdict $lmdict --only-source \
       --trainpref $lmdatadir/train.tokens \
       --validpref $lmdatadir/$valid_set.tokens \
@@ -206,12 +211,12 @@ if [ $stage -le 4 ]; then
   mkdir -p $lmdir/log
   log_file=$lmdir/log/train.log
   [ -f $lmdir/checkpoint_last.pt ] && log_file="-a $log_file"
-  CUDA_VISIBLE_DEVICES=$free_gpu python3 ../../train.py $lmdatadir --seed 1 --user-dir espresso \
+  CUDA_VISIBLE_DEVICES=$free_gpu python3 ../../fairseq_cli/train.py $lmdatadir --seed 1 --user-dir espresso \
     --task language_modeling_for_asr --dict $lmdict \
     --log-interval $((1000/ngpus)) --log-format simple \
     --num-workers 0 --max-tokens 25600 --max-sentences 1024 \
     --valid-subset $valid_subset --max-sentences-valid 1536 \
-    --distributed-world-size $ngpus --distributed-port $(if [ $ngpus -gt 1 ]; then echo 100; else echo -1; fi) \
+    --distributed-world-size $ngpus \
     --max-epoch 25 --optimizer adam --lr 0.001 --clip-norm 1.0 \
     --lr-scheduler reduce_lr_on_plateau --lr-shrink 0.5 \
     --save-dir $lmdir --restore-file checkpoint_last.pt --save-interval-updates $((1000/ngpus)) \
@@ -227,7 +232,7 @@ if [ $stage -le 5 ]; then
   test_set_array=($test_set)
   for i in $(seq 0 $num); do
     log_file=$lmdir/log/evaluation_${test_set_array[$i]}.log
-    python3 ../../eval_lm.py $lmdatadir --user-dir espresso --cpu \
+    python3 ../../fairseq_cli/eval_lm.py $lmdatadir --user-dir espresso --cpu \
       --task language_modeling_for_asr --dict $lmdict --gen-subset ${gen_set_array[$i]} \
       --max-tokens 40960 --max-sentences 1536 --sample-break-mode eos \
       --path $lmdir/$lm_checkpoint 2>&1 | tee $log_file
@@ -261,26 +266,34 @@ if [ $stage -le 7 ]; then
   mkdir -p $dir/log
   log_file=$dir/log/train.log
   [ -f $dir/checkpoint_last.pt ] && log_file="-a $log_file"
-  if $apply_specaug; then
-    opts="$opts --max-epoch 100 --lr-scheduler tri_stage --warmup-steps $((1000/ngpus)) --hold-steps $((140000/ngpus)) --decay-steps $((330000/ngpus))"
-    opts="$opts --encoder-rnn-hidden-size 1024 --encoder-rnn-layers 5 --decoder-embed-dim 512 --decoder-hidden-size 1024"
-    opts="$opts --decoder-out-embed-dim 3072 --attention-dim 512 --dropout 0.4"
-    specaug_config="{'W': 40, 'F': 18, 'T': 70, 'num_freq_masks': 2, 'num_time_masks': 2, 'p': 0.2}"
+  update_freq=$(((2+ngpus-1)/ngpus))
+  if $use_transformer; then
+    opts="$opts --arch speech_transformer_swbd --max-epoch 100 --lr-scheduler tri_stage"
+    opts="$opts --warmup-steps $((25000/ngpus/update_freq)) --hold-steps $((180000/ngpus/update_freq)) --decay-steps $((320000/ngpus/update_freq))"
+    if $apply_specaug; then
+      specaug_config="{'W': 40, 'F': 18, 'T': 70, 'num_freq_masks': 2, 'num_time_masks': 2, 'p': 0.2}"
+    fi
   else
-    opts="$opts --max-epoch 35 --lr-scheduler reduce_lr_on_plateau_v2 --lr-shrink 0.5 --start-reduce-lr-epoch 14"
+    opts="$opts --arch speech_conv_lstm_swbd --scheduled-sampling-probs 0.9,0.8,0.7,0.6 --start-scheduled-sampling-epoch 6"
+    if $apply_specaug; then
+      opts="$opts --max-epoch 100 --lr-scheduler tri_stage --warmup-steps $((1000/ngpus/update_freq)) --hold-steps $((180000/ngpus/update_freq)) --decay-steps $((360000/ngpus/update_freq))"
+      opts="$opts --encoder-rnn-hidden-size 1024 --encoder-rnn-layers 5 --decoder-embed-dim 512 --decoder-hidden-size 1024"
+      opts="$opts --decoder-out-embed-dim 3072 --attention-dim 512 --dropout 0.4"
+      specaug_config="{'W': 40, 'F': 18, 'T': 70, 'num_freq_masks': 2, 'num_time_masks': 2, 'p': 0.2}"
+    else
+      opts="$opts --max-epoch 35 --lr-scheduler reduce_lr_on_plateau_v2 --lr-shrink 0.5 --start-reduce-lr-epoch 14"
+    fi
   fi
   CUDA_VISIBLE_DEVICES=$free_gpu speech_train.py data --task speech_recognition_espresso --seed 1 --user-dir espresso \
-    --log-interval $((3000/ngpus)) --log-format simple --print-training-sample-interval $((4000/ngpus)) \
-    --num-workers 0 --data-buffer-size 0 --max-tokens 26000 --max-sentences 48 --curriculum 2 \
-    --valid-subset $valid_subset --max-sentences-valid 64 --ddp-backend no_c10d \
-    --distributed-world-size $ngpus --distributed-port $(if [ $ngpus -gt 1 ]; then echo 100; else echo -1; fi) \
+    --log-interval $((3000/ngpus/update_freq)) --log-format simple --print-training-sample-interval $((4000/ngpus/update_freq)) \
+    --num-workers 0 --data-buffer-size 0 --max-tokens 26000 --max-sentences 48 --curriculum 2 --empty-cache-freq 50 \
+    --valid-subset $valid_subset --max-sentences-valid 64 --ddp-backend no_c10d --update-freq $update_freq \
+    --distributed-world-size $ngpus \
     --optimizer adam --lr 0.001 --weight-decay 0.0 --clip-norm 2.0 \
-    --save-dir $dir --restore-file checkpoint_last.pt --save-interval-updates $((3000/ngpus)) \
+    --save-dir $dir --restore-file checkpoint_last.pt --save-interval-updates $((3000/ngpus/update_freq)) \
     --keep-interval-updates 3 --keep-last-epochs 5 --validate-interval 1 --best-checkpoint-metric wer \
-    --arch speech_conv_lstm_swbd --criterion label_smoothed_cross_entropy_v2 \
-    --label-smoothing 0.1 --smoothing-type uniform \
-    --scheduled-sampling-probs 0.9,0.8,0.7,0.6 --start-scheduled-sampling-epoch 6 \
-    --dict $dict --bpe sentencepiece --sentencepiece-vocab ${sentencepiece_model}.model --non-lang-syms $nlsyms \
+    --criterion label_smoothed_cross_entropy_v2 --label-smoothing 0.1 --smoothing-type uniform \
+    --dict $dict --bpe sentencepiece --sentencepiece-model ${sentencepiece_model}.model --non-lang-syms $nlsyms \
     --max-source-positions 9999 --max-target-positions 999 \
     $opts --specaugment-config "$specaug_config" 2>&1 | tee $log_file
 fi
@@ -301,7 +314,7 @@ if [ $stage -le 8 ]; then
     decode_dir=$dir/decode_${dataset}${decode_affix:+_${decode_affix}}
     CUDA_VISIBLE_DEVICES=$(echo $free_gpu | sed 's/,/ /g' | awk '{print $1}') speech_recognize.py data \
       --task speech_recognition_espresso --user-dir espresso --max-tokens 24000 --max-sentences 48 \
-      --num-shards 1 --shard-id 0 --dict $dict --bpe sentencepiece --sentencepiece-vocab ${sentencepiece_model}.model \
+      --num-shards 1 --shard-id 0 --dict $dict --bpe sentencepiece --sentencepiece-model ${sentencepiece_model}.model \
       --non-lang-syms $nlsyms --gen-subset $dataset --max-source-positions 9999 --max-target-positions 999 \
       --path $path --beam 35 --max-len-a 0.1 --max-len-b 0 --lenpen 1.0 \
       --results-path $decode_dir $opts

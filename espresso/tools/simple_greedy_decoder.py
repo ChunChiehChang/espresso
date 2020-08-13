@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -14,8 +14,9 @@ from torch import Tensor
 
 class SimpleGreedyDecoder(nn.Module):
     def __init__(
-        self, models, dictionary, max_len_a=0, max_len_b=200, retain_dropout=False,
-        temperature=1.0, for_validation=True,
+        self, models, dictionary, max_len_a=0, max_len_b=200,
+        temperature=1.0, eos=None, symbols_to_strip_from_output=None,
+        for_validation=True,
     ):
         """Decode given speech audios with the simple greedy search.
 
@@ -25,8 +26,6 @@ class SimpleGreedyDecoder(nn.Module):
             dictionary (~fairseq.data.Dictionary): dictionary
             max_len_a/b (int, optional): generate sequences of maximum length
                 ax + b, where x is the source length
-            retain_dropout (bool, optional): use dropout when generating
-                (default: False)
             temperature (float, optional): temperature, where values
                 >1.0 produce more uniform samples and values <1.0 produce
                 sharper samples (default: 1.0)
@@ -43,15 +42,18 @@ class SimpleGreedyDecoder(nn.Module):
             self.model = EnsembleModel(models)
         self.pad = dictionary.pad()
         self.unk = dictionary.unk()
-        self.eos = dictionary.eos()
+        self.eos = dictionary.eos() if eos is None else eos
+        self.symbols_to_strip_from_output = (
+            symbols_to_strip_from_output.union({self.eos})
+            if symbols_to_strip_from_output is not None else {self.eos}
+        )
         self.vocab_size = len(dictionary)
         self.max_len_a = max_len_a
         self.max_len_b = max_len_b
-        self.retain_dropout = retain_dropout
         self.temperature = temperature
         assert temperature > 0, "--temperature must be greater than 0"
-        if not self.retain_dropout:
-            self.model.eval()
+
+        self.model.eval()
         self.for_validation = for_validation
 
     def cuda(self):
@@ -68,11 +70,17 @@ class SimpleGreedyDecoder(nn.Module):
             bos_token (int, optional): beginning of sentence token
                 (default: self.eos)
         """
-        self.model.reset_incremental_state()
         return self._decode(sample, **kwargs)
 
     @torch.no_grad()
     def _decode(self, sample: Dict[str, Dict[str, Tensor]], bos_token: Optional[int] = None):
+        incremental_states = torch.jit.annotate(
+            List[Dict[str, Dict[str, Optional[Tensor]]]],
+            [
+                torch.jit.annotate(Dict[str, Dict[str, Optional[Tensor]]], {})
+                for i in range(self.model.models_size)
+            ],
+        )
         net_input = sample["net_input"]
         src_tokens = net_input["src_tokens"]
         input_size = src_tokens.size()
@@ -111,7 +119,10 @@ class SimpleGreedyDecoder(nn.Module):
                     attn = attn[:, :, :step + 1]
                 break
             log_probs, avg_attn_scores = self.model.forward_decoder(
-                tokens[:, :step + 1], encoder_outs, temperature=self.temperature,
+                tokens[:, : step + 1],
+                encoder_outs,
+                incremental_states,
+                temperature=self.temperature,
             )
             tokens[:, step + 1] = log_probs.argmax(-1)
             if step > 0:  # deal with finished predictions

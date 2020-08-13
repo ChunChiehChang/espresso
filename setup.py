@@ -136,6 +136,7 @@ setup(
     install_requires=[
         'cffi',
         'cython',
+        'editdistance',
         'kaldi_io',
         'numpy',
         'regex',

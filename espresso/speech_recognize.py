@@ -13,6 +13,8 @@ import math
 import os
 import sys
 
+import numpy as np
+
 import torch
 
 from fairseq import checkpoint_utils, options, tasks, utils
@@ -35,9 +37,16 @@ def main(args):
     if args.results_path is not None:
         os.makedirs(args.results_path, exist_ok=True)
         output_path = os.path.join(args.results_path, 'decode.log')
-        with open(output_path, 'w', buffering=1) as h:
+        with open(output_path, 'w', buffering=1, encoding='utf-8') as h:
             return _main(args, h)
     return _main(args, sys.stdout)
+
+
+def get_symbols_to_strip_from_output(generator):
+    if hasattr(generator, 'symbols_to_strip_from_output'):
+        return generator.symbols_to_strip_from_output
+    else:
+        return {generator.eos, generator.pad}
 
 
 def _main(args, output_file):
@@ -59,6 +68,11 @@ def _main(args, output_file):
         args.max_tokens = 12000
     logger.info(args)
 
+    # Fix seed for stochastic decoding
+    if args.seed is not None and not args.no_seed_provided:
+        np.random.seed(args.seed)
+        utils.set_torch_seed(args.seed)
+
     use_cuda = torch.cuda.is_available() and not args.cpu
 
     # Load dataset split
@@ -74,6 +88,7 @@ def _main(args, output_file):
         utils.split_paths(args.path),
         arg_overrides=eval(args.model_overrides),
         task=task,
+        suffix=getattr(args, "checkpoint_suffix", ""),
     )
     for i, m in enumerate(models):
         if hasattr(m, 'is_wordlm') and m.is_wordlm:
@@ -102,10 +117,7 @@ def _main(args, output_file):
 
     # Optimize ensemble for generation
     for model in models:
-        model.make_generation_fast_(
-            beamable_mm_beam_size=None if args.no_beamable_mm else args.beam,
-            need_attn=args.print_alignment,
-        )
+        model.prepare_for_inference_(args)
         if args.fp16:
             model.half()
         if use_cuda:
@@ -195,7 +207,7 @@ def _main(args, output_file):
                 hypo_str = dictionary.string(
                     hypo['tokens'].int().cpu(),
                     bpe_symbol=None,
-                    extra_symbols_to_ignore={dictionary.pad()},
+                    extra_symbols_to_ignore=get_symbols_to_strip_from_output(generator),
                 )  # not removing bpe at this point
                 detok_hypo_str = decode_fn(hypo_str)
                 if not args.quiet:
@@ -217,7 +229,7 @@ def _main(args, output_file):
 
         wps_meter.update(num_generated_tokens)
         progress.log({'wps': round(wps_meter.avg)})
-        num_sentences += sample['nsentences']
+        num_sentences += sample['nsentences'] if 'nsentences' in sample else sample['id'].numel()
 
     logger.info('NOTE: hypothesis and token scores are output in base 2')
     logger.info('Recognized {} utterances ({} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)'.format(

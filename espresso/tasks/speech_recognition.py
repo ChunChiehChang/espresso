@@ -12,7 +12,7 @@ import os
 import torch
 
 from fairseq import search, utils
-from fairseq.data import ConcatDataset
+from fairseq.data import BaseWrapperDataset, ConcatDataset
 from fairseq.logging import metrics
 from fairseq.tasks import FairseqTask, register_task
 
@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 def get_asr_dataset_from_json(
     data_path, split, tgt_dict,
     combine, upsample_primary,
+    num_buckets=0, shuffle=True,
     seed=1, specaugment_config=None,
 ):
     """
@@ -112,6 +113,8 @@ def get_asr_dataset_from_json(
         tgt_dict,
         left_pad_source=False,
         left_pad_target=False,
+        num_buckets=num_buckets,
+        shuffle=shuffle,
     )
 
 
@@ -159,6 +162,10 @@ class SpeechRecognitionEspressoTask(FairseqTask):
                             help="max number of tokens in the target sequence")
         parser.add_argument("--upsample-primary", default=1, type=int,
                             help="amount to upsample primary dataset")
+        parser.add_argument("--num-batch-buckets", default=0, type=int, metavar="N",
+                            help="if >0, then bucket source and target lengths into N "
+                            "buckets and pad accordingly; this is useful on TPUs "
+                            "to minimize the number of compilations")
         parser.add_argument("--feat-in-channels", default=1, type=int, metavar="N",
                             help="feature input channels")
         parser.add_argument("--specaugment-config", default=None, type=str, metavar="EXPR",
@@ -233,13 +240,19 @@ class SpeechRecognitionEspressoTask(FairseqTask):
             data_path, split, self.tgt_dict,
             combine=combine,
             upsample_primary=self.args.upsample_primary,
+            num_buckets=self.args.num_batch_buckets,
+            shuffle=(split != getattr(self.args, "gen_subset", "")),
             seed=self.args.seed,
             specaugment_config=self.specaugment_config,
         )
 
         src_dataset = self.datasets[split].src
-        self.feat_dim = src_dataset.feat_dim if not isinstance(src_dataset, ConcatDataset) \
-            else src_dataset.datasets[0].feat_dim
+        if isinstance(src_dataset, ConcatDataset):
+            self.feat_dim = src_dataset.datasets[0].feat_dim
+        elif isinstance(src_dataset, BaseWrapperDataset):
+            self.feat_dim = src_dataset.dataset.feat_dim
+        else:
+            self.feat_dim = src_dataset.feat_dim
 
         # update the counts of <eos> and <unk> in tgt_dict with training data
         if split == "train":
@@ -250,7 +263,10 @@ class SpeechRecognitionEspressoTask(FairseqTask):
                 unk_count += (tgt_dataset[i][0] == self.tgt_dict.unk()).int().sum().item()
             self.tgt_dict.count[self.tgt_dict.unk()] = unk_count
 
-    def build_generator(self, models, args):
+    def build_generator(
+        self, models, args,
+        seq_gen_cls=None, extra_gen_cls_kwargs=None
+    ):
         if getattr(args, "score_reference", False):
             args.score_reference = False
             logger.warning(
@@ -309,7 +325,13 @@ class SpeechRecognitionEspressoTask(FairseqTask):
         else:
             search_strategy = search.BeamSearch(self.target_dictionary)
 
-        return SequenceGenerator(
+        if seq_gen_cls is None:
+            seq_gen_cls = SequenceGenerator
+        extra_gen_cls_kwargs = extra_gen_cls_kwargs or {}
+        extra_gen_cls_kwargs["lm_weight"] = getattr(args, "lm_weight", 0.0)
+        extra_gen_cls_kwargs["eos_factor"] = getattr(args, "eos_factor", None)
+
+        return seq_gen_cls(
             models,
             self.target_dictionary,
             beam_size=getattr(args, "beam", 5),
@@ -323,8 +345,7 @@ class SpeechRecognitionEspressoTask(FairseqTask):
             match_source_len=getattr(args, "match_source_len", False),
             no_repeat_ngram_size=getattr(args, "no_repeat_ngram_size", 0),
             search_strategy=search_strategy,
-            lm_weight=getattr(args, "lm_weight", 0.0),
-            eos_factor=getattr(args, "eos_factor", None),
+            **extra_gen_cls_kwargs,
         )
 
     def build_dataset_for_inference(self, src_tokens, src_lengths):

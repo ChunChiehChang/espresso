@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -27,7 +27,7 @@ from fairseq.models.lstm import (
     LSTMCell,
     Linear,
 )
-from fairseq.modules import AdaptiveSoftmax
+from fairseq.modules import AdaptiveSoftmax, FairseqDropout
 
 from espresso.modules import speech_attention
 from espresso.tools.scheduled_sampling_rate_scheduler import ScheduledSamplingRateScheduler
@@ -152,7 +152,7 @@ class SpeechLSTMModel(FairseqEncoderDecoderModel):
             pretrained_decoder_embed = load_pretrained_embedding_from_file(
                 args.decoder_embed_path,
                 task.target_dictionary,
-                args.decoder_embed_dim
+                args.decoder_embed_dim,
             )
         # one last double check of parameter combinations
         if args.share_decoder_input_output_embed and (
@@ -201,6 +201,7 @@ class SpeechLSTMModel(FairseqEncoderDecoderModel):
             dropout_out=args.encoder_rnn_dropout_out,
             bidirectional=args.encoder_rnn_bidirectional,
             residual=args.encoder_rnn_residual,
+            src_bucketed=(getattr(task.args, "num_batch_buckets", 0) > 0),
             max_source_positions=max_source_positions,
         )
         decoder = SpeechLSTMDecoder(
@@ -328,14 +329,14 @@ class SpeechLSTMEncoder(FairseqEncoder):
     def __init__(
         self, conv_layers_before=None, input_size=83, hidden_size=512,
         num_layers=1, dropout_in=0.1, dropout_out=0.1, bidirectional=False,
-        residual=False, left_pad=False, padding_value=0.,
+        residual=False, left_pad=False, padding_value=0., src_bucketed=False,
         max_source_positions=DEFAULT_MAX_SOURCE_POSITIONS,
     ):
         super().__init__(None)  # no src dictionary
         self.conv_layers_before = conv_layers_before
         self.num_layers = num_layers
-        self.dropout_in = dropout_in
-        self.dropout_out = dropout_out
+        self.dropout_in_module = FairseqDropout(dropout_in, module_name=self.__class__.__name__)
+        self.dropout_out_module = FairseqDropout(dropout_out, module_name=self.__class__.__name__)
         self.bidirectional = bidirectional
         self.hidden_size = hidden_size
         self.residual = residual
@@ -351,6 +352,7 @@ class SpeechLSTMEncoder(FairseqEncoder):
         ])
         self.left_pad = left_pad
         self.padding_value = padding_value
+        self.src_bucketed = src_bucketed
 
         self.output_units = hidden_size
         if bidirectional:
@@ -395,7 +397,7 @@ class SpeechLSTMEncoder(FairseqEncoder):
 
         bsz, seqlen = x.size(0), x.size(1)
 
-        x = F.dropout(x, p=self.dropout_in, training=self.training)
+        x = self.dropout_in_module(x)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -408,7 +410,12 @@ class SpeechLSTMEncoder(FairseqEncoder):
                 prev_x = x
             # pack embedded source tokens into a PackedSequence
             packed_x = nn.utils.rnn.pack_padded_sequence(
-                x, src_lengths.data, enforce_sorted=enforce_sorted
+                x,
+                (
+                    src_lengths.data if not self.src_bucketed else
+                    src_lengths.new_full(src_lengths.size(), x.size(0))
+                ),
+                enforce_sorted=enforce_sorted
             )
 
             # apply LSTM
@@ -417,7 +424,7 @@ class SpeechLSTMEncoder(FairseqEncoder):
             # unpack outputs and apply dropout
             x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=self.padding_value*1.0)
             if i < len(self.lstm) - 1:  # not applying dropout for the last layer
-                x = F.dropout(x, p=self.dropout_out, training=self.training)
+                x = self.dropout_out_module(x)
             x = x + prev_x if self.residual and i > 0 else x
         assert list(x.size()) == [seqlen, bsz, self.output_units]
 
@@ -433,15 +440,25 @@ class SpeechLSTMEncoder(FairseqEncoder):
         )
 
     def reorder_encoder_out(self, encoder_out: EncoderOut, new_order):
-        encoder_padding_mask = encoder_out.encoder_padding_mask.index_select(1, new_order) \
-            if encoder_out.encoder_padding_mask is not None else None
+        encoder_padding_mask: Optional[Tensor] = encoder_out.encoder_padding_mask
+        src_lengths: Optional[Tensor] = encoder_out.src_lengths
+        new_encoder_padding_mask = (
+            encoder_padding_mask
+            if encoder_padding_mask is None
+            else encoder_padding_mask.index_select(1, new_order)
+        )
+        new_src_lengths = (
+            src_lengths
+            if src_lengths is None
+            else src_lengths.index_select(0, new_order)
+        )
         return EncoderOut(
             encoder_out=encoder_out.encoder_out.index_select(1, new_order),
-            encoder_padding_mask=encoder_padding_mask,
+            encoder_padding_mask=new_encoder_padding_mask,
             encoder_embedding=None,
             encoder_states=None,
             src_tokens=None,
-            src_lengths=encoder_out.src_lengths.index_select(0, new_order),
+            src_lengths=new_src_lengths,
         )
 
     def max_positions(self):
@@ -460,8 +477,8 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
         scheduled_sampling_rate_scheduler=None,
     ):
         super().__init__(dictionary)
-        self.dropout_in = dropout_in
-        self.dropout_out = dropout_out
+        self.dropout_in_module = FairseqDropout(dropout_in, module_name=self.__class__.__name__)
+        self.dropout_out_module = FairseqDropout(dropout_out, module_name=self.__class__.__name__)
         self.hidden_size = hidden_size
         self.share_input_output_embed = share_input_output_embed
         if attn_type is None or attn_type.lower() == "none":
@@ -510,24 +527,12 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
         if adaptive_softmax_cutoff is not None:
             # setting adaptive_softmax dropout to dropout_out for now but can be redefined
             self.adaptive_softmax = AdaptiveSoftmax(
-                num_embeddings, hidden_size, adaptive_softmax_cutoff, dropout=dropout_out
+                num_embeddings, hidden_size, adaptive_softmax_cutoff, dropout=dropout_out,
             )
         elif not self.share_input_output_embed:
             self.fc_out = Linear(out_embed_dim, num_embeddings, dropout=dropout_out)
 
         self.scheduled_sampling_rate_scheduler = scheduled_sampling_rate_scheduler
-
-    def get_cached_state(self, incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]]):
-        cached_state = self.get_incremental_state(incremental_state, "cached_state")
-        assert cached_state is not None
-        prev_hiddens_ = cached_state["prev_hiddens"]
-        assert prev_hiddens_ is not None
-        prev_cells_ = cached_state["prev_cells"]
-        assert prev_cells_ is not None
-        prev_hiddens = [prev_hiddens_[i] for i in range(self.num_layers)]
-        prev_cells = [prev_cells_[j] for j in range(self.num_layers)]
-        input_feed = cached_state["input_feed"]  # can be None for decoder-only language models
-        return prev_hiddens, prev_cells, input_feed
 
     def forward(
         self,
@@ -550,7 +555,7 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
                 - the decoder's output of shape `(batch, tgt_len, vocab)`
                 - attention weights of shape `(batch, tgt_len, src_len)`
         """
-        if self.scheduled_sampling_rate_scheduler is not None:
+        if self.training and self.scheduled_sampling_rate_scheduler is not None:
             epoch = kwargs.get("epoch", 1)
             sampling_prob = self.scheduled_sampling_rate_scheduler.step(epoch)
             if sampling_prob < 1.0:  # apply scheduled sampling
@@ -624,7 +629,7 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
 
         # embed tokens
         x = self.embed_tokens(prev_output_tokens)
-        x = F.dropout(x, p=self.dropout_in, training=self.training)
+        x = self.dropout_in_module(x)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -667,7 +672,7 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
                     input = torch.cat((hidden, context), dim=1)
                 else:
                     input = hidden
-                input = F.dropout(input, p=self.dropout_out, training=self.training)
+                input = self.dropout_out_module(input)
                 if self.residual and i > 0:
                     if encoder_out is not None:
                         hidden_sum = input[:, :hidden.size(1)] + prev_layer_hidden
@@ -691,7 +696,11 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
         prev_cells_tensor = torch.stack(prev_cells)
         cache_state = torch.jit.annotate(
             Dict[str, Optional[Tensor]],
-            {"prev_hiddens": prev_hiddens_tensor, "prev_cells": prev_cells_tensor, "input_feed": input_feed}
+            {
+                "prev_hiddens": prev_hiddens_tensor,
+                "prev_cells": prev_cells_tensor,
+                "input_feed": input_feed,
+            }
         )
         self.set_incremental_state(incremental_state, "cached_state", cache_state)
 
@@ -704,7 +713,7 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
 
         if hasattr(self, "additional_fc") and self.adaptive_softmax is None:
             x = self.additional_fc(x)
-            x = F.dropout(x, p=self.dropout_out, training=self.training)
+            x = self.dropout_out_module(x)
         # srclen x tgtlen x bsz -> bsz x tgtlen x srclen
         if not self.training and encoder_out is not None and self.need_attn:
             assert attn_scores is not None
@@ -725,24 +734,40 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
         else:
             return features
 
-    def reorder_state(self, state: List[Tensor], new_order):
-        return [
-            state_i.index_select(0, new_order) if state_i is not None else None
-            for state_i in state
-        ]
+    def get_cached_state(
+        self,
+        incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
+    ) -> Tuple[List[Tensor], List[Tensor], Optional[Tensor]]:
+        cached_state = self.get_incremental_state(incremental_state, "cached_state")
+        assert cached_state is not None
+        prev_hiddens_ = cached_state["prev_hiddens"]
+        assert prev_hiddens_ is not None
+        prev_cells_ = cached_state["prev_cells"]
+        assert prev_cells_ is not None
+        prev_hiddens = [prev_hiddens_[i] for i in range(self.num_layers)]
+        prev_cells = [prev_cells_[j] for j in range(self.num_layers)]
+        input_feed = cached_state["input_feed"]  # can be None for decoder-only language models
+        return prev_hiddens, prev_cells, input_feed
 
-    def reorder_incremental_state(self, incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]], new_order):
-        super().reorder_incremental_state(incremental_state, new_order)
+    def reorder_incremental_state(
+        self,
+        incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
+        new_order: Tensor,
+    ):
         if incremental_state is None or len(incremental_state) == 0:
             return
         prev_hiddens, prev_cells, input_feed = self.get_cached_state(incremental_state)
-        cached_state = (prev_hiddens, prev_cells, [input_feed])
-        new_state = [self.reorder_state(state, new_order) for state in cached_state]
-        prev_hiddens_tensor = torch.stack(new_state[0])
-        prev_cells_tensor = torch.stack(new_state[1])
+        prev_hiddens = [p.index_select(0, new_order) for p in prev_hiddens]
+        prev_cells = [p.index_select(0, new_order) for p in prev_cells]
+        if input_feed is not None:
+            input_feed = input_feed.index_select(0, new_order)
         cached_state_new = torch.jit.annotate(
             Dict[str, Optional[Tensor]],
-            {"prev_hiddens": prev_hiddens_tensor, "prev_cells": prev_cells_tensor, "input_feed": new_state[2][0]}
+            {
+                "prev_hiddens": torch.stack(prev_hiddens),
+                "prev_cells": torch.stack(prev_cells),
+                "input_feed": input_feed,
+            }
         )
         self.set_incremental_state(incremental_state, "cached_state", cached_state_new),
         return
@@ -752,33 +777,37 @@ class SpeechLSTMDecoder(FairseqIncrementalDecoder):
             assert another_cached_state is None or len(another_cached_state) == 0
             return
         prev_hiddens, prev_cells, input_feed = self.get_cached_state(incremental_state)
-        cached_state = (prev_hiddens, prev_cells, [input_feed])
-        another_cached_state = (another_cached_state[0], another_cached_state[1], [another_cached_state[2]])
+        another_prev_hiddens, another_prev_cells, another_input_feed = \
+            another_cached_state[0], another_cached_state[1], another_cached_state[2]
 
-        def mask_copy_state(state: List[Tensor], another_state: List[Tensor]):
-            new_state = []
-            for state_i, another_state_i in zip(state, another_state):
-                if state_i is None:
-                    assert another_state_i is None
-                    new_state.append(None)
-                else:
-                    assert state_i.size(0) == mask.size(0) and another_state_i is not None and \
-                        state_i.size() == another_state_i.size()
-                    mask_unsqueezed = mask
-                    for _ in range(1, len(state_i.size())):
-                        mask_unsqueezed = mask_unsqueezed.unsqueeze(-1)
-                    new_state.append(torch.where(mask_unsqueezed, state_i, another_state_i))
-            return new_state
+        def mask_copy_state(state: Optional[Tensor], another_state: Optional[Tensor]):
+            if state is None:
+                assert another_state is None
+                return None
+            else:
+                assert (
+                    state.size(0) == mask.size(0) and another_state is not None and
+                    state.size() == another_state.size()
+                )
+                mask_unsqueezed = mask
+                for _ in range(1, len(state.size())):
+                    mask_unsqueezed = mask_unsqueezed.unsqueeze(-1)
+                return torch.where(mask_unsqueezed, state, another_state)
 
-        new_state = [
-            mask_copy_state(state, another_state)
-            for (state, another_state) in zip(cached_state, another_cached_state)
+        prev_hiddens_new = [
+            mask_copy_state(p, another_p) for (p, another_p) in zip(prev_hiddens, another_prev_hiddens)
         ]
-        prev_hiddens_tensor = torch.stack(new_state[0])
-        prev_cells_tensor = torch.stack(new_state[1])
+        prev_cells_new = [
+            mask_copy_state(p, another_p) for (p, another_p) in zip(prev_cells, another_prev_cells)
+        ]
+        input_feed_new = mask_copy_state(input_feed, another_input_feed)
         cached_state_new = torch.jit.annotate(
             Dict[str, Optional[Tensor]],
-            {"prev_hiddens": prev_hiddens_tensor, "prev_cells": prev_cells_tensor, "input_feed": new_state[2][0]}
+            {
+                "prev_hiddens": torch.stack(prev_hiddens_new),
+                "prev_cells": torch.stack(prev_cells_new),
+                "input_feed": input_feed_new,
+            }
         )
         self.set_incremental_state(incremental_state, "cached_state", cached_state_new)
 

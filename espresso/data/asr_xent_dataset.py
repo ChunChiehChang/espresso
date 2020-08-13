@@ -26,20 +26,33 @@ logger = logging.getLogger(__name__)
 
 
 def collate(
-    samples, pad_idx, chunk_width, chunk_left_context, chunk_right_context, label_delay,
-    seed, epoch, random_chunking=True,
+    samples,
+    pad_idx,
+    chunk_width,
+    chunk_left_context,
+    chunk_right_context,
+    label_delay,
+    seed,
+    epoch,
+    pad_to_length=None,
+    src_bucketed=False,
+    random_chunking=True,
 ):
     if len(samples) == 0:
         return {}
 
-    def merge(key):
+    def merge(key, pad_to_length=None):
         if key == "source":
-            return speech_utils.collate_frames([s[key] for s in samples], 0.0)
+            return speech_utils.collate_frames(
+                [s[key] for s in samples], 0.0,
+                pad_to_length=pad_to_length,
+            )
         elif key == "target":
             return data_utils.collate_tokens(
                 [s[key] for s in samples],
                 pad_idx=pad_idx, eos_idx=None,
                 left_pad=False, move_eos_to_beginning=False,
+                pad_to_length=pad_to_length,
             )
         else:
             raise ValueError("Invalid key.")
@@ -94,17 +107,22 @@ def collate(
                 else:
                     s["source"] = src_item[: label_delay]
 
-        src_lengths = torch.IntTensor([s["source"].size(0) for s in samples])
+        if pad_to_length is not None or src_bucketed:
+            src_lengths = torch.IntTensor([
+                s["source"].ne(0.0).any(dim=1).int().sum() for s in samples
+            ])
+        else:
+            src_lengths = torch.IntTensor([s["source"].size(0) for s in samples])
         id = torch.LongTensor([s["id"] for s in samples])
         utt_id = [s["utt_id"] for s in samples]
-        src_frames = merge("source")
+        src_frames = merge("source", pad_to_length=pad_to_length["source"] if pad_to_length is not None else None)
 
         target = None
         if samples[0].get("target", None) is not None:
-            target = merge("target")
-            ntokens = sum(len(s["target"]) for s in samples)
+            target = merge("target", pad_to_length=pad_to_length["target"] if pad_to_length is not None else None)
+            ntokens = sum(s["target"].ne(pad_idx).int().sum().item() for s in samples)
         else:
-            ntokens = sum(s["source"].size(0) for s in samples)
+            ntokens = src_lengths.sum().item()
 
         text = None
         if samples[0].get("text", None) is not None:
@@ -135,7 +153,12 @@ def collate(
         }
         return batch
     else:  # sequential chunking, usually for chunk-wise test data
-        src_lengths = torch.IntTensor([s["source"].size(0) for s in samples])
+        if pad_to_length is not None or src_bucketed:
+            src_lengths = torch.IntTensor([
+                s["source"].ne(0.0).any(dim=1).int().sum() for s in samples
+            ])
+        else:
+            src_lengths = torch.IntTensor([s["source"].size(0) for s in samples])
         id = torch.LongTensor([s["id"] for s in samples])
         utt_id = [s["utt_id"] for s in samples]
         ori_source = [s["source"] for s in samples]
@@ -157,15 +180,15 @@ def collate(
                     )
                     s["target"] = ori_target[i].new_full((chunk_width,), pad_idx) \
                         if ori_target[i] is not None else None
-            src_frames = merge("source")
+            src_frames = merge("source", pad_to_length=pad_to_length["source"] if pad_to_length is not None else None)
             src_chunk_lengths = torch.IntTensor([s["source"].size(0) for s in samples])
 
             target = None
             if samples[0].get("target", None) is not None:
-                target = merge("target")
+                target = merge("target", pad_to_length=pad_to_length["target"] if pad_to_length is not None else None)
                 ntokens = sum(s["target"].ne(pad_idx).int().sum().item() for s in samples)
             else:
-                ntokens = sum(s["source"].size(0) for s in samples)
+                ntokens = src_lengths.sum().item()
 
             batch = {
                 "id": id,
@@ -317,21 +340,23 @@ class AsrXentDataset(FairseqDataset):
         tgt_vocab_size (int, optional): used for setting padding index
         text  (torch.utils.data.Dataset, optional): text dataset to wrap
         shuffle (bool, optional): shuffle dataset elements before batching
-            (default: True)
-        seed (int, optional): random seed for generating a chunk from an utterance
-        chunk_width (int, optional): chunk width for chunk-wise training
-        chunk_left_context (int, optional): number of frames appended to the left of a chunk
-        chunk_right_context (int, optional): number of frames appended to the right of a chunk
+            (default: True).
+        num_buckets (int, optional): if set to a value greater than 0, then
+            batches will be bucketed into the given number of batch shapes.
+        seed (int, optional): random seed for generating a chunk from an utterance.
+        chunk_width (int, optional): chunk width for chunk-wise training.
+        chunk_left_context (int, optional): number of frames appended to the left of a chunk.
+        chunk_right_context (int, optional): number of frames appended to the right of a chunk.
         label_delay (int, optional): offset of the alignments as prediction labels. Can be
-            useful in archs such as asymmetric convolution, unidirectional LSTM, etc
+            useful in archs such as asymmetric convolution, unidirectional LSTM, etc.
         random_chunking (bool, optional): wether do random chunking from utterance, or sequntially
-            obtain chunks within each utterance. True for train and False for valid/test data
+            obtain chunks within each utterance. True for train and False for valid/test data.
     """
 
     def __init__(
         self, src, src_sizes, tgt: Optional[AliScpCachedDataset] = None, tgt_sizes=None, text=None,
-        shuffle=True, seed=1, chunk_width=None, chunk_left_context=None, chunk_right_context=None,
-        label_delay=0, random_chunking=True,
+        shuffle=True, num_buckets=0, seed=1, chunk_width=None,
+        chunk_left_context=None, chunk_right_context=None, label_delay=0, random_chunking=True,
     ):
         self.src = src
         self.tgt = tgt
@@ -372,6 +397,40 @@ class AsrXentDataset(FairseqDataset):
                 if self.text is not None:
                     self.text.filter_and_reorder(indices)
                 logger.warning("Done removal. {} examples remaining".format(len(indices)))
+
+        if num_buckets > 0:
+            from fairseq.data import BucketPadLengthDataset
+            from espresso.data import FeatBucketPadLengthDataset
+            self.src = FeatBucketPadLengthDataset(
+                self.src,
+                sizes=self.src_sizes,
+                num_buckets=num_buckets,
+                pad_idx=0.0,
+                left_pad=False,
+            )
+            self.src_sizes = self.src.sizes
+            logger.info("bucketing source lengths: {}".format(list(self.src.buckets)))
+            if self.tgt is not None:
+                self.tgt = BucketPadLengthDataset(
+                    self.tgt,
+                    sizes=self.tgt_sizes,
+                    num_buckets=num_buckets,
+                    pad_idx=self.dictionary.pad(),
+                    left_pad=False,
+                )
+                self.tgt_sizes = self.tgt.sizes
+                logger.info("bucketing target lengths: {}".format(list(self.tgt.buckets)))
+
+            # determine bucket sizes using self.num_tokens, which will return
+            # the padded lengths (thanks to FeatBucketPadLengthDataset)
+            num_tokens = np.vectorize(self.num_tokens, otypes=[np.long])
+            self.bucketed_num_tokens = num_tokens(np.arange(len(self.src)))
+            self.buckets = [
+                (None, num_tokens)
+                for num_tokens in np.unique(self.bucketed_num_tokens)
+            ]
+        else:
+            self.buckets = None
 
     def _match_src_tgt(self):
         """Makes utterances in src and tgt the same order in terms of
@@ -421,6 +480,9 @@ class AsrXentDataset(FairseqDataset):
         assert self.src.utt_ids == self.text.utt_ids
         return True
 
+    def get_batch_shapes(self):
+        return self.buckets
+
     def __getitem__(self, index):
         tgt_item = self.tgt[index] if self.tgt is not None else None
         text_item = self.text[index][1] if self.text is not None else None
@@ -437,11 +499,15 @@ class AsrXentDataset(FairseqDataset):
     def __len__(self):
         return len(self.src)
 
-    def collater(self, samples):
+    def collater(self, samples, pad_to_length=None):
         """Merge a list of samples to form a mini-batch.
 
         Args:
             samples (List[dict]): samples to collate
+            pad_to_length (dict, optional): a dictionary of
+                {'source': source_pad_to_length, 'target': target_pad_to_length}
+                to indicate the max length to pad to in source and target respectively.
+
 
         Returns:
             dict: a mini-batch with the following keys:
@@ -463,9 +529,16 @@ class AsrXentDataset(FairseqDataset):
         """
         # pad_idx=-100 matches the default in criterions
         return collate(
-            samples, pad_idx=-100, chunk_width=self.chunk_width,
-            chunk_left_context=self.chunk_left_context, chunk_right_context=self.chunk_right_context,
-            label_delay=self.label_delay, seed=self.seed, epoch=self.epoch,
+            samples,
+            pad_idx=-100,
+            chunk_width=self.chunk_width,
+            chunk_left_context=self.chunk_left_context,
+            chunk_right_context=self.chunk_right_context,
+            label_delay=self.label_delay,
+            seed=self.seed,
+            epoch=self.epoch,
+            pad_to_length=pad_to_length,
+            src_bucketed=(self.buckets is not None),
             random_chunking=self.random_chunking,
         )
 
@@ -488,9 +561,18 @@ class AsrXentDataset(FairseqDataset):
             indices = np.random.permutation(len(self))
         else:
             indices = np.arange(len(self))
-        if self.tgt_sizes is not None:
-            indices = indices[np.argsort(self.tgt_sizes[indices], kind="mergesort")]
-        return indices[np.argsort(self.src_sizes[indices], kind="mergesort")]
+        if self.buckets is None:
+            # sort by target length, then source length
+            if self.tgt_sizes is not None:
+                indices = indices[
+                    np.argsort(self.tgt_sizes[indices], kind="mergesort")
+                ]
+            return indices[np.argsort(self.src_sizes[indices], kind="mergesort")]
+        else:
+            # sort by bucketed_num_tokens, which is padded_src_len
+            return indices[
+                np.argsort(self.bucketed_num_tokens[indices], kind="mergesort")
+            ]
 
     @property
     def supports_prefetch(self):
