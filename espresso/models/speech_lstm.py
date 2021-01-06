@@ -324,6 +324,61 @@ class ConvBNReLU(nn.Module):
         return x, x_lengths, padding_mask
 
 
+class ConvBNReLU2(nn.Module):
+    """Sequence of convolution-BatchNorm-ReLU layers."""
+    def __init__(self, out_channels, kernel_sizes, strides, in_channels=1):
+        super().__init__()
+        self.out_channels = out_channels
+        self.kernel_sizes = kernel_sizes
+        self.strides = strides
+        self.in_channels = in_channels
+        self.padding = (kernel_sizes[0] - 1) // 2
+
+        num_layers = len(out_channels)
+        assert num_layers == len(kernel_sizes) and num_layers == len(strides)
+
+        self.convolutions = nn.ModuleList()
+        self.batchnorms = nn.ModuleList()
+        for i in range(num_layers):
+            self.convolutions.append(
+                Convolution2d(
+                    self.in_channels if i == 0 else self.out_channels[i-1],
+                    self.out_channels[i],
+                    self.kernel_sizes[i], self.strides[i]))
+            self.batchnorms.append(nn.BatchNorm2d(out_channels[i]))
+
+    def output_lengths(self, in_lengths):
+        out_lengths = in_lengths
+        for stride in self.strides:
+            if isinstance(stride, (list, tuple)):
+                assert len(stride) > 0
+                s = stride[0]
+            else:
+                assert isinstance(stride, int)
+                s = stride
+            out_lengths = (out_lengths + s - 1) // s
+        return out_lengths
+
+    def forward(self, src, src_lengths):
+        # B X T X C -> B X (input channel num) x T X (C / input channel num)
+        x = src.view(
+            src.size(0), src.size(1), self.in_channels, src.size(2) // self.in_channels,
+        ).transpose(1, 2)
+        for conv, bn in zip(self.convolutions, self.batchnorms):
+            x = F.relu(bn(conv(x)))
+        # B X (output channel num) x T X C' -> B X T X (output channel num) X C'
+        x = x.transpose(1, 2)
+        # B X T X (output channel num) X C' -> B X T X C
+        x = x.contiguous().view(x.size(0), x.size(1), x.size(2) * x.size(3))
+
+        x_lengths = self.output_lengths(src_lengths)
+        padding_mask = ~speech_utils.sequence_mask(x_lengths, x.size(1))
+        if padding_mask.any():
+            x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
+        return x, x_lengths, padding_mask
+
+
 class SpeechLSTMEncoder(FairseqEncoder):
     """LSTM encoder."""
     def __init__(
@@ -875,6 +930,26 @@ def base_architecture(args):
     args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
     args.share_decoder_input_output_embed = getattr(args, "share_decoder_input_output_embed", False)
     args.pretrained_lm_checkpoint = getattr(args, "pretrained_lm_checkpoint", None)
+
+
+@register_model_architecture("speech_lstm", "speech_conv_lstm_yomdle")
+def conv_lstm_yomdle(args):
+    args.encoder_conv_channels = getattr(
+        args, "encoder_conv_channels", "[32, 32, 128, 128, 512, 512]",
+    )
+    args.encoder_conv_kernel_sizes = getattr(
+        args, "encoder_conv_kernel_sizes", "[(7, 7), (5, 5), (5, 5), (5, 5), (3, 3), (3, 3)]",
+    )
+    args.encoder_conv_strides = getattr(
+        args, "encoder_conv_strides", "[(1, 1), (2, 2), (1, 1), (2, 2), (1, 1), (1, 1)]",
+    )
+    args.encoder_rnn_hidden_size = getattr(args, "encoder_rnn_hidden_size", 1024)
+    args.encoder_rnn_layers = getattr(args, "encoder_rnn_layers", 3)
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 512)
+    args.decoder_hidden_size = getattr(args, "decoder_hidden_size", 1024)
+    args.decoder_layers = getattr(args, "decoder_layers", 3)
+    args.decoder_out_embed_dim = getattr(args, "decoder_out_embed_dim", 2048)
+    base_architecture(args)
 
 
 @register_model_architecture("speech_lstm", "speech_conv_lstm_wsj")

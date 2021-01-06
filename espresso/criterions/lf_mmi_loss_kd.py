@@ -3,115 +3,29 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pdb
+
 import logging
 import math
 
 import torch
 
-from fairseq import utils
+from espresso.criterions.lf_mmi_loss import ChainLossFunction
+
+from fairseq import checkpoint_utils, utils
 from fairseq.criterions import FairseqCriterion, register_criterion
 from fairseq.logging import metrics
 
 
 logger = logging.getLogger(__name__)
 
-
-class ChainLossFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, input_lengths, num_graphs, den_graphs, leaky_coefficient=1e-5):
-        try:
-            import pychain_C
-        except ImportError:
-            raise ImportError(
-                "Please install OpenFST and PyChain by `make openfst pychain` "
-                "after entering espresso/tools"
-            )
-
-        input = input.clamp(-10, 10)  # clamp for both the denominator and the numerator
-        B = input.size(0)
-        if B != num_graphs.batch_size or B != den_graphs.batch_size:
-            raise ValueError(
-                "input batch size ({}) does not equal to num graph batch size ({}) "
-                "or den graph batch size ({})"
-                .format(B, num_graphs.batch_size, den_graphs.batch_size)
-            )
-        packed_data = torch.nn.utils.rnn.pack_padded_sequence(
-            input, input_lengths, batch_first=True,
-        )
-        batch_sizes = packed_data.batch_sizes
-        input_lengths = input_lengths.cpu()
-
-        exp_input = input.exp()
-        den_objf, input_grad, denominator_ok = pychain_C.forward_backward(
-            den_graphs.forward_transitions,
-            den_graphs.forward_transition_indices,
-            den_graphs.forward_transition_probs,
-            den_graphs.backward_transitions,
-            den_graphs.backward_transition_indices,
-            den_graphs.backward_transition_probs,
-            den_graphs.leaky_probs,
-            den_graphs.initial_probs,
-            den_graphs.final_probs,
-            den_graphs.start_state,
-            exp_input,
-            batch_sizes,
-            input_lengths,
-            den_graphs.num_states,
-            leaky_coefficient,
-        )
-        denominator_ok = denominator_ok.item()
-
-        assert num_graphs.log_domain
-        num_objf, log_probs_grad, numerator_ok = pychain_C.forward_backward_log_domain(
-            num_graphs.forward_transitions,
-            num_graphs.forward_transition_indices,
-            num_graphs.forward_transition_probs,
-            num_graphs.backward_transitions,
-            num_graphs.backward_transition_indices,
-            num_graphs.backward_transition_probs,
-            num_graphs.initial_probs,
-            num_graphs.final_probs,
-            num_graphs.start_state,
-            input,
-            batch_sizes,
-            input_lengths,
-            num_graphs.num_states,
-        )
-        numerator_ok = numerator_ok.item()
-
-        loss = -num_objf + den_objf
-
-        if (loss - loss) != 0.0 or not denominator_ok or not numerator_ok:
-            default_loss = 10
-            input_grad = torch.zeros_like(input)
-            logger.warning(
-                f"Loss is {loss} and denominator computation "
-                f"(if done) returned {denominator_ok} "
-                f"and numerator computation returned {numerator_ok} "
-                f", setting loss to {default_loss} per frame"
-            )
-            loss = torch.full_like(num_objf, default_loss * input_lengths.sum())
-        else:
-            num_grad = log_probs_grad.exp()
-            input_grad -= num_grad
-
-        ctx.save_for_backward(input_grad)
-        return loss
-
-    @staticmethod
-    def backward(ctx, objf_grad):
-        input_grad, = ctx.saved_tensors
-        input_grad = torch.mul(input_grad, objf_grad)
-
-        return input_grad, None, None, None, None
-
-
-@register_criterion("lattice_free_mmi")
-class LatticeFreeMMICriterion(FairseqCriterion):
+@register_criterion("lattice_free_mmi_kd")
+class LatticeFreeMMICriterionKD(FairseqCriterion):
 
     def __init__(
         self, task, sentence_avg, denominator_fst_path,
         leaky_hmm_coefficient, xent_regularize, output_l2_regularize,
+        teacher_model_path, kd_topk
     ):
         super().__init__(task)
         try:
@@ -129,6 +43,13 @@ class LatticeFreeMMICriterion(FairseqCriterion):
         self.leaky_hmm_coefficient = leaky_hmm_coefficient
         self.xent_regularize = xent_regularize
         self.output_l2_regularize = output_l2_regularize
+        self.teacher_model, self._teacher_model_args = checkpoint_utils.load_model_ensemble(utils.split_paths(teacher_model_path)) 
+        self.teacher_model = self.teacher_model[0]
+        self.teacher_model.to(torch.cuda.current_device())
+
+        self.topk = kd_topk
+        
+        self.MSELoss = torch.nn.MSELoss()
 
     @staticmethod
     def add_args(parser):
@@ -145,6 +66,10 @@ class LatticeFreeMMICriterion(FairseqCriterion):
         parser.add_argument("--output-l2-regularization-coefficient", default=0.0,
                             type=float, metavar="F", dest="output_l2_regularize",
                             help="L2 regularization coefficient for the network's output")
+        parser.add_argument("--teacher-model-path", type=str, metavar="FILE",
+                            help="path to teacher model")
+        parser.add_argument("--kd-topk", default=10, type=int, metavar="INT",
+                            help="Compare the top K values for KD")
         # fmt: on
 
     def forward(self, model, sample, reduce=True):
@@ -156,19 +81,21 @@ class LatticeFreeMMICriterion(FairseqCriterion):
         3) logging outputs to display while training
         """
         net_output = model(**sample["net_input"])
-        loss, nll_loss = self.compute_loss(net_output, sample, reduce=reduce)
+        teacher_output = self.teacher_model(**sample["net_input"])
+        loss, nll_loss, kd_loss = self.compute_loss(net_output, teacher_output, sample, reduce=reduce)
 
         sample_size = sample["target"].batch_size if self.sentence_avg else sample["ntokens"]
         logging_output = {
             "loss": loss.data,
             "nll_loss": nll_loss.data,
+            "kd_loss": kd_loss.data,
             "ntokens": sample["ntokens"],
             "nsentences": sample["nsentences"],
             "sample_size": sample_size,
         }
         return loss, sample_size, logging_output
 
-    def compute_loss(self, net_output, sample, reduce=True):
+    def compute_loss(self, net_output, teacher_output, sample, reduce=True):
         try:
             from pychain.graph import ChainGraphBatch
             from pychain.loss import ChainFunction
@@ -200,19 +127,44 @@ class LatticeFreeMMICriterion(FairseqCriterion):
                 pad_mask = encoder_padding_mask.transpose(0, 1).unsqueeze(-1)  # T x B -> B x T x 1
                 encoder_out_squared.masked_fill_(pad_mask, 0.0)
             loss += 0.5 * self.output_l2_regularize * encoder_out_squared.sum()
+        
+        kd_loss = 100000 * self.compute_loss_kd(net_output, teacher_output)
+        loss += kd_loss
+        #pdb.set_trace()
 
-        return loss, nll_loss
+        return loss, nll_loss, kd_loss
+
+    def compute_loss_kd(self, net_output, teacher_output):
+        values, indices = torch.topk(net_output.encoder_out, self.topk, dim=2)
+        student_matrix = torch.zeros(net_output.encoder_out.shape).to(torch.cuda.current_device()).scatter(2, indices, values)
+        values, indices = torch.topk(teacher_output.encoder_out, self.topk, dim=2)
+        teacher_matrix = torch.zeros(teacher_output.encoder_out.shape).to(torch.cuda.current_device()).scatter(2, indices, values)
+        loss = self.MSELoss(student_matrix, teacher_matrix)
+        return loss
+
+    def state_dict(self, *args, **kwargs):
+        state_dict = super().state_dict(*args, **kwargs)
+        return state_dict
+    
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        state_dict_subset = state_dict.copy()
+        if "state_prior" in state_dict:
+            del state_dict_subset["state_prior"]
+        super().load_state_dict(state_dict_subset, *args, **kwargs)
 
     @staticmethod
     def reduce_metrics(logging_outputs) -> None:
         """Aggregate logging outputs from data parallel training."""
         loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
         nll_loss_sum = sum(log.get('nll_loss', 0) for log in logging_outputs)
+        kd_loss_sum = sum(log.get('kd_loss', 0) for log in logging_outputs)
         ntokens = sum(log.get("ntokens", 0) for log in logging_outputs)
         sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
 
+        #pdb.set_trace()
         metrics.log_scalar("loss", loss_sum / sample_size / math.log(2), sample_size, round=7)
         metrics.log_scalar("nll_loss", nll_loss_sum / ntokens / math.log(2), ntokens, round=7)
+        metrics.log_scalar("kd_loss", kd_loss_sum / sample_size / math.log(2), sample_size, round=7)
         metrics.log_derived("ppl", lambda meters: utils.get_perplexity(meters["nll_loss"].avg, round=4))
 
     @staticmethod

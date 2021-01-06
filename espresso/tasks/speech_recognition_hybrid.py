@@ -325,7 +325,7 @@ class SpeechRecognitionHybridTask(FairseqTask):
             upsample_primary=self.args.upsample_primary,
             num_buckets=self.args.num_batch_buckets,
             shuffle=(split != getattr(self.args, "gen_subset", "")),
-            lf_mmi=(self.args.criterion == "lattice_free_mmi"),
+            lf_mmi=("lattice_free_mmi" in self.args.criterion),
             seed=self.args.seed, specaugment_config=self.specaugment_config,
             chunk_width=None if self.training_stage and split in self.args.valid_subset.split(",") else self.chunk_width,
             chunk_left_context=self.chunk_left_context, chunk_right_context=self.chunk_right_context,
